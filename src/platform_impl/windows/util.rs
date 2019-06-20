@@ -1,5 +1,4 @@
 use std::{mem, ptr, slice, io};
-use std::ops::BitAnd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::window::CursorIcon;
@@ -9,12 +8,7 @@ use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::um::winbase::lstrlenW;
 use winapi::um::winuser;
 
-pub fn has_flag<T>(bitset: T, flag: T) -> bool
-where T:
-    Copy + PartialEq + BitAnd<T, Output = T>
-{
-    bitset & flag == flag
-}
+pub use crate::util::*;
 
 pub fn wchar_to_string(wchar: &[wchar_t]) -> String {
     String::from_utf16_lossy(wchar).to_string()

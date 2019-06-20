@@ -25,12 +25,12 @@ fn main() {
         thread::spawn(move || {
             while let Ok(event) = rx.recv() {
                 match event {
-                    WindowEvent::KeyboardInput { input: KeyboardInput {
+                    WindowEvent::KeyboardInput (KeyboardInput {
                         state: ElementState::Released,
                         virtual_keycode: Some(key),
                         modifiers,
                         ..
-                    }, .. } => {
+                    }) => {
                         window.set_title(&format!("{:?}", key));
                         let state = !modifiers.shift;
                         use self::VirtualKeyCode::*;
@@ -99,9 +99,9 @@ fn main() {
                 match event {
                     WindowEvent::CloseRequested
                     | WindowEvent::Destroyed
-                    | WindowEvent::KeyboardInput { input: KeyboardInput {
+                    | WindowEvent::KeyboardInput(KeyboardInput {
                         virtual_keycode: Some(VirtualKeyCode::Escape),
-                    .. }, .. } => {
+                    .. }) => {
                         window_senders.remove(&window_id);
                     },
                     _ => if let Some(tx) = window_senders.get(&window_id) {

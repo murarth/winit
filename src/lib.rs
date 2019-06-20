@@ -104,5 +104,6 @@ mod icon;
 mod platform_impl;
 pub mod window;
 pub mod monitor;
+mod util;
 
 pub mod platform;

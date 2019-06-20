@@ -22,7 +22,7 @@ use std::sync::mpsc::{self, Sender, Receiver};
 use std::time::{Duration, Instant};
 use std::rc::Rc;
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
 use parking_lot::Mutex;
 
@@ -41,45 +41,55 @@ use winapi::shared::minwindef::{
 use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::shared::{windowsx, winerror};
 use winapi::um::{winuser, winbase, ole2, processthreadsapi, commctrl, libloaderapi};
-use winapi::um::winnt::{LONG, LPCSTR, SHORT};
+use winapi::um::winnt::{HANDLE, LONG, LPCSTR, SHORT};
 
 use crate::window::WindowId as RootWindowId;
 use crate::event_loop::{ControlFlow, EventLoopWindowTarget as RootELW, EventLoopClosed};
-use crate::dpi::{LogicalPosition, LogicalSize, PhysicalSize};
-use crate::event::{DeviceEvent, Touch, TouchPhase, StartCause, KeyboardInput, Event, WindowEvent};
-use crate::platform_impl::platform::{event, WindowId, DEVICE_ID, wrap_device_id, util};
-use crate::platform_impl::platform::dpi::{
-    become_dpi_aware,
-    dpi_to_scale_factor,
-    enable_non_client_dpi_scaling,
-    hwnd_scale_factor,
+use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
+use crate::event::{
+    MouseButton, Touch, TouchPhase, StartCause, KeyboardInput, Event, WindowEvent,
+    device::{GamepadEvent, KeyboardEvent, HidEvent, MouseEvent}
 };
-use crate::platform_impl::platform::drop_handler::FileDropHandler;
-use crate::platform_impl::platform::event::{handle_extended_keys, process_key_params, vkey_to_winit_vkey};
-use crate::platform_impl::platform::raw_input::{get_raw_input_data, get_raw_mouse_button_state};
-use crate::platform_impl::platform::window::adjust_size;
-use crate::platform_impl::platform::window_state::{CursorFlags, WindowFlags, WindowState};
+use crate::platform_impl::platform::{
+    MouseId, KeyboardId, HidId, GamepadHandle, WindowId,
+    dpi::{become_dpi_aware, dpi_to_scale_factor, enable_non_client_dpi_scaling, hwnd_scale_factor},
+    drop_handler::FileDropHandler,
+    event::{self, handle_extended_keys, process_key_params, vkey_to_winit_vkey},
+    gamepad::Gamepad,
+    raw_input::{self, get_raw_input_data, get_raw_mouse_button_state, RawInputData},
+    util,
+    window::adjust_size,
+    window_state::{CursorFlags, WindowFlags, WindowState},
+};
 
 pub(crate) struct SubclassInput<T> {
     pub window_state: Arc<Mutex<WindowState>>,
-    pub event_loop_runner: EventLoopRunnerShared<T>,
+    pub shared_data: Rc<SubclassSharedData<T>>,
     pub file_drop_handler: FileDropHandler,
 }
 
 impl<T> SubclassInput<T> {
     unsafe fn send_event(&self, event: Event<T>) {
-        self.event_loop_runner.send_event(event);
+        self.shared_data.runner_shared.send_event(event);
     }
 }
 
 struct ThreadMsgTargetSubclassInput<T> {
-    event_loop_runner: EventLoopRunnerShared<T>,
+    shared_data: Rc<SubclassSharedData<T>>,
     user_event_receiver: Receiver<T>,
+}
+
+#[derive(Debug)]
+pub(crate) enum DeviceId {
+    Mouse(MouseId),
+    Keyboard(KeyboardId),
+    Hid(HidId),
+    Gamepad(GamepadHandle, Gamepad),
 }
 
 impl<T> ThreadMsgTargetSubclassInput<T> {
     unsafe fn send_event(&self, event: Event<T>) {
-        self.event_loop_runner.send_event(event);
+        self.shared_data.runner_shared.send_event(event);
     }
 }
 
@@ -92,7 +102,7 @@ pub struct EventLoopWindowTarget<T> {
     thread_id: DWORD,
     trigger_newevents_on_redraw: Arc<AtomicBool>,
     thread_msg_target: HWND,
-    pub(crate) runner_shared: EventLoopRunnerShared<T>,
+    pub(crate) shared_data: Rc<SubclassSharedData<T>>,
 }
 
 impl<T: 'static> EventLoop<T> {
@@ -108,11 +118,14 @@ impl<T: 'static> EventLoop<T> {
         become_dpi_aware(dpi_aware);
 
         let thread_id = unsafe { processthreadsapi::GetCurrentThreadId() };
-        let runner_shared = Rc::new(ELRShared {
-            runner: RefCell::new(None),
-            buffer: RefCell::new(VecDeque::new()),
+        let shared_data = Rc::new(SubclassSharedData {
+            runner_shared: ELRShared {
+                runner: RefCell::new(None),
+                buffer: RefCell::new(VecDeque::new()),
+            },
+            active_device_ids: RefCell::new(HashMap::default()),
         });
-        let (thread_msg_target, thread_msg_sender) = thread_event_target_window(runner_shared.clone());
+        let (thread_msg_target, thread_msg_sender) = thread_event_target_window(shared_data.clone());
 
         EventLoop {
             thread_msg_sender,
@@ -121,7 +134,7 @@ impl<T: 'static> EventLoop<T> {
                     thread_id,
                     trigger_newevents_on_redraw: Arc::new(AtomicBool::new(true)),
                     thread_msg_target,
-                    runner_shared,
+                    shared_data,
                 },
                 _marker: PhantomData,
             },
@@ -149,10 +162,10 @@ impl<T: 'static> EventLoop<T> {
             }
         ) };
         {
-            let runner_shared = self.window_target.p.runner_shared.clone();
-            let mut runner_ref = runner_shared.runner.borrow_mut();
+            let shared_data = self.window_target.p.shared_data.clone();
+            let mut runner_ref = shared_data.runner_shared.runner.borrow_mut();
             loop {
-                let event = runner_shared.buffer.borrow_mut().pop_front();
+                let event = shared_data.runner_shared.buffer.borrow_mut().pop_front();
                 match event {
                     Some(e) => { runner.process_event(e); },
                     None => break
@@ -162,7 +175,7 @@ impl<T: 'static> EventLoop<T> {
         }
 
         macro_rules! runner {
-            () => { self.window_target.p.runner_shared.runner.borrow_mut().as_mut().unwrap() };
+            () => { self.window_target.p.shared_data.runner_shared.runner.borrow_mut().as_mut().unwrap() };
         }
 
         unsafe {
@@ -204,7 +217,7 @@ impl<T: 'static> EventLoop<T> {
         }
 
         runner!().call_event_handler(Event::LoopDestroyed);
-        *self.window_target.p.runner_shared.runner.borrow_mut() = None;
+        *self.window_target.p.shared_data.runner_shared.runner.borrow_mut() = None;
     }
 
     pub fn create_proxy(&self) -> EventLoopProxy<T> {
@@ -212,6 +225,63 @@ impl<T: 'static> EventLoop<T> {
             target_window: self.window_target.p.thread_msg_target,
             event_send: self.thread_msg_sender.clone(),
         }
+    }
+
+    fn devices<R: 'static>(&self, f: impl FnMut(&DeviceId) -> Option<R>) -> impl '_ + Iterator<Item=R> {
+        // Flush WM_INPUT and WM_INPUT_DEVICE_CHANGE events so that the active_device_ids list is
+        // accurate. This is essential to make this function work if called before calling `run` or
+        // `run_return`.
+        unsafe {
+            let mut msg = mem::uninitialized();
+            loop {
+                let result = winuser::PeekMessageW(
+                    &mut msg,
+                    self.window_target.p.thread_msg_target,
+                    winuser::WM_INPUT_DEVICE_CHANGE,
+                    winuser::WM_INPUT,
+                    1
+                );
+                if 0 == result {
+                    break;
+                }
+                winuser::TranslateMessage(&mut msg);
+                winuser::DispatchMessageW(&mut msg);
+            }
+        }
+
+        self.window_target.p.shared_data.active_device_ids.borrow()
+            .values()
+            .filter_map(f)
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    pub fn mouses(&self) -> impl '_ + Iterator<Item=crate::event::device::MouseId> {
+        self.devices(|d| match d {
+            DeviceId::Mouse(id) => Some(id.clone().into()),
+            _ => None
+        })
+    }
+
+    pub fn keyboards(&self) -> impl '_ + Iterator<Item=crate::event::device::KeyboardId> {
+        self.devices(|d| match d {
+            DeviceId::Keyboard(id) => Some(id.clone().into()),
+            _ => None
+        })
+    }
+
+    pub fn hids(&self) -> impl '_ + Iterator<Item=crate::event::device::HidId> {
+        self.devices(|d| match d {
+            DeviceId::Hid(id) => Some(id.clone().into()),
+            _ => None
+        })
+    }
+
+    pub fn gamepads(&self) -> impl '_ + Iterator<Item=crate::event::device::GamepadHandle> {
+        self.devices(|d| match d {
+            DeviceId::Gamepad(handle, _) => Some(handle.clone().into()),
+            _ => None
+        })
     }
 }
 
@@ -226,7 +296,11 @@ impl<T> EventLoopWindowTarget<T> {
     }
 }
 
-pub(crate) type EventLoopRunnerShared<T> = Rc<ELRShared<T>>;
+pub(crate) struct SubclassSharedData<T> {
+    pub runner_shared: ELRShared<T>,
+    pub active_device_ids: RefCell<HashMap<HANDLE, DeviceId>>,
+}
+
 pub(crate) struct ELRShared<T> {
     runner: RefCell<Option<EventLoopRunner<T>>>,
     buffer: RefCell<VecDeque<Event<T>>>,
@@ -691,7 +765,7 @@ lazy_static! {
     };
 }
 
-fn thread_event_target_window<T>(event_loop_runner: EventLoopRunnerShared<T>) -> (HWND, Sender<T>) {
+fn thread_event_target_window<T>(shared_data: Rc<SubclassSharedData<T>>) -> (HWND, Sender<T>) {
     unsafe {
         let window = winuser::CreateWindowExW(
             winuser::WS_EX_NOACTIVATE | winuser::WS_EX_TRANSPARENT | winuser::WS_EX_LAYERED,
@@ -717,7 +791,7 @@ fn thread_event_target_window<T>(event_loop_runner: EventLoopRunnerShared<T>) ->
         let (tx, rx) = mpsc::channel();
 
         let subclass_input = ThreadMsgTargetSubclassInput {
-            event_loop_runner,
+            shared_data,
             user_event_receiver: rx,
         };
         let input_ptr = Box::into_raw(Box::new(subclass_input));
@@ -728,6 +802,9 @@ fn thread_event_target_window<T>(event_loop_runner: EventLoopRunnerShared<T>) ->
             input_ptr as DWORD_PTR
         );
         assert_eq!(subclass_result, 1);
+
+        // Set up raw input
+        raw_input::register_for_raw_input(window);
 
         (window, tx)
     }
@@ -781,14 +858,14 @@ unsafe extern "system" fn public_window_callback<T>(
 
     match msg {
         winuser::WM_ENTERSIZEMOVE => {
-            let mut runner = subclass_input.event_loop_runner.runner.borrow_mut();
+            let mut runner = subclass_input.shared_data.runner_shared.runner.borrow_mut();
             if let Some(ref mut runner) = *runner {
                 runner.in_modal_loop = true;
             }
             0
         },
         winuser::WM_EXITSIZEMOVE => {
-            let mut runner = subclass_input.event_loop_runner.runner.borrow_mut();
+            let mut runner = subclass_input.shared_data.runner_shared.runner.borrow_mut();
             if let Some(ref mut runner) = *runner {
                 runner.in_modal_loop = false;
             }
@@ -837,7 +914,7 @@ unsafe extern "system" fn public_window_callback<T>(
 
         _ if msg == *REQUEST_REDRAW_NO_NEWEVENTS_MSG_ID => {
             use crate::event::WindowEvent::RedrawRequested;
-            let mut runner = subclass_input.event_loop_runner.runner.borrow_mut();
+            let mut runner = subclass_input.shared_data.runner_shared.runner.borrow_mut();
             if let Some(ref mut runner) = *runner {
                 // This check makes sure that calls to `request_redraw()` during `EventsCleared`
                 // handling dispatch `RedrawRequested` immediately after `EventsCleared`, without
@@ -956,7 +1033,7 @@ unsafe extern "system" fn public_window_callback<T>(
             if mouse_was_outside_window {
                 subclass_input.send_event(Event::WindowEvent {
                     window_id: RootWindowId(WindowId(window)),
-                    event: CursorEntered { device_id: DEVICE_ID },
+                    event: CursorEntered,
                 });
 
                 // Calling TrackMouseEvent in order to receive mouse leave events.
@@ -975,7 +1052,7 @@ unsafe extern "system" fn public_window_callback<T>(
 
             subclass_input.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: CursorMoved { device_id: DEVICE_ID, position, modifiers: event::get_key_mods() },
+                event: CursorMoved { position, modifiers: event::get_key_mods() },
             });
 
             0
@@ -990,7 +1067,7 @@ unsafe extern "system" fn public_window_callback<T>(
 
             subclass_input.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: CursorLeft { device_id: DEVICE_ID },
+                event: CursorLeft,
             });
 
             0
@@ -1005,7 +1082,7 @@ unsafe extern "system" fn public_window_callback<T>(
 
             subclass_input.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: WindowEvent::MouseWheel { device_id: DEVICE_ID, delta: LineDelta(0.0, value), phase: TouchPhase::Moved, modifiers: event::get_key_mods() },
+                event: WindowEvent::MouseWheel { delta: LineDelta(0.0, value), phase: TouchPhase::Moved, modifiers: event::get_key_mods() },
             });
 
             0
@@ -1020,7 +1097,7 @@ unsafe extern "system" fn public_window_callback<T>(
 
             subclass_input.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: WindowEvent::MouseWheel { device_id: DEVICE_ID, delta: LineDelta(value, 0.0), phase: TouchPhase::Moved, modifiers: event::get_key_mods() },
+                event: WindowEvent::MouseWheel { delta: LineDelta(value, 0.0), phase: TouchPhase::Moved, modifiers: event::get_key_mods() },
             });
 
             0
@@ -1035,15 +1112,12 @@ unsafe extern "system" fn public_window_callback<T>(
                 if let Some((scancode, vkey)) = process_key_params(wparam, lparam) {
                     subclass_input.send_event(Event::WindowEvent {
                         window_id: RootWindowId(WindowId(window)),
-                        event: WindowEvent::KeyboardInput {
-                            device_id: DEVICE_ID,
-                            input: KeyboardInput {
-                                state: Pressed,
-                                scancode: scancode,
-                                virtual_keycode: vkey,
-                                modifiers: event::get_key_mods(),
-                            },
-                        },
+                        event: WindowEvent::KeyboardInput(KeyboardInput {
+                            state: Pressed,
+                            scancode: scancode,
+                            virtual_keycode: vkey,
+                            modifiers: event::get_key_mods(),
+                        }),
                     });
                     // Windows doesn't emit a delete character by default, but in order to make it
                     // consistent with the other platforms we'll emit a delete character here.
@@ -1063,15 +1137,12 @@ unsafe extern "system" fn public_window_callback<T>(
             if let Some((scancode, vkey)) = process_key_params(wparam, lparam) {
                 subclass_input.send_event(Event::WindowEvent {
                     window_id: RootWindowId(WindowId(window)),
-                    event: WindowEvent::KeyboardInput {
-                        device_id: DEVICE_ID,
-                        input: KeyboardInput {
-                            state: Released,
-                            scancode: scancode,
-                            virtual_keycode: vkey,
-                            modifiers: event::get_key_mods(),
-                        },
-                    },
+                    event: WindowEvent::KeyboardInput(KeyboardInput {
+                        state: Released,
+                        scancode: scancode,
+                        virtual_keycode: vkey,
+                        modifiers: event::get_key_mods(),
+                    }),
                 });
             }
             0
@@ -1079,91 +1150,84 @@ unsafe extern "system" fn public_window_callback<T>(
 
         winuser::WM_LBUTTONDOWN => {
             use crate::event::WindowEvent::MouseInput;
-            use crate::event::MouseButton::Left;
             use crate::event::ElementState::Pressed;
 
             capture_mouse(window, &mut *subclass_input.window_state.lock());
 
             subclass_input.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Pressed, button: Left, modifiers: event::get_key_mods() },
+                event: MouseInput { state: Pressed, button: MouseButton::Left, modifiers: event::get_key_mods() },
             });
             0
         },
 
         winuser::WM_LBUTTONUP => {
             use crate::event::WindowEvent::MouseInput;
-            use crate::event::MouseButton::Left;
             use crate::event::ElementState::Released;
 
             release_mouse(&mut *subclass_input.window_state.lock());
 
             subclass_input.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Released, button: Left, modifiers: event::get_key_mods() },
+                event: MouseInput { state: Released, button: MouseButton::Left, modifiers: event::get_key_mods() },
             });
             0
         },
 
         winuser::WM_RBUTTONDOWN => {
             use crate::event::WindowEvent::MouseInput;
-            use crate::event::MouseButton::Right;
             use crate::event::ElementState::Pressed;
 
             capture_mouse(window, &mut *subclass_input.window_state.lock());
 
             subclass_input.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Pressed, button: Right, modifiers: event::get_key_mods() },
+                event: MouseInput { state: Pressed, button: MouseButton::Right, modifiers: event::get_key_mods() },
             });
             0
         },
 
         winuser::WM_RBUTTONUP => {
             use crate::event::WindowEvent::MouseInput;
-            use crate::event::MouseButton::Right;
             use crate::event::ElementState::Released;
 
             release_mouse(&mut *subclass_input.window_state.lock());
 
             subclass_input.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Released, button: Right, modifiers: event::get_key_mods() },
+                event: MouseInput { state: Released, button: MouseButton::Right, modifiers: event::get_key_mods() },
             });
             0
         },
 
         winuser::WM_MBUTTONDOWN => {
             use crate::event::WindowEvent::MouseInput;
-            use crate::event::MouseButton::Middle;
             use crate::event::ElementState::Pressed;
 
             capture_mouse(window, &mut *subclass_input.window_state.lock());
 
             subclass_input.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Pressed, button: Middle, modifiers: event::get_key_mods() },
+                event: MouseInput { state: Pressed, button: MouseButton::Middle, modifiers: event::get_key_mods() },
             });
             0
         },
 
         winuser::WM_MBUTTONUP => {
             use crate::event::WindowEvent::MouseInput;
-            use crate::event::MouseButton::Middle;
             use crate::event::ElementState::Released;
 
             release_mouse(&mut *subclass_input.window_state.lock());
 
             subclass_input.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Released, button: Middle, modifiers: event::get_key_mods() },
+                event: MouseInput { state: Released, button: MouseButton::Middle, modifiers: event::get_key_mods() },
             });
             0
         },
 
         winuser::WM_XBUTTONDOWN => {
             use crate::event::WindowEvent::MouseInput;
-            use crate::event::MouseButton::Other;
             use crate::event::ElementState::Pressed;
             let xbutton = winuser::GET_XBUTTON_WPARAM(wparam);
 
@@ -1171,14 +1235,13 @@ unsafe extern "system" fn public_window_callback<T>(
 
             subclass_input.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Pressed, button: Other(xbutton as u8), modifiers: event::get_key_mods() },
+                event: MouseInput { state: Pressed, button: MouseButton::Other(xbutton as u8), modifiers: event::get_key_mods() },
             });
             0
         },
 
         winuser::WM_XBUTTONUP => {
             use crate::event::WindowEvent::MouseInput;
-            use crate::event::MouseButton::Other;
             use crate::event::ElementState::Released;
             let xbutton = winuser::GET_XBUTTON_WPARAM(wparam);
 
@@ -1186,128 +1249,9 @@ unsafe extern "system" fn public_window_callback<T>(
 
             subclass_input.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Released, button: Other(xbutton as u8), modifiers: event::get_key_mods() },
+                event: MouseInput { state: Released, button: MouseButton::Other(xbutton as u8), modifiers: event::get_key_mods() },
             });
             0
-        },
-
-        winuser::WM_INPUT_DEVICE_CHANGE => {
-            let event = match wparam as _ {
-                winuser::GIDC_ARRIVAL => DeviceEvent::Added,
-                winuser::GIDC_REMOVAL => DeviceEvent::Removed,
-                _ => unreachable!(),
-            };
-
-            subclass_input.send_event(Event::DeviceEvent {
-                device_id: wrap_device_id(lparam as _),
-                event,
-            });
-
-            0
-        },
-
-        winuser::WM_INPUT => {
-            use crate::event::DeviceEvent::{Motion, MouseMotion, MouseWheel, Button, Key};
-            use crate::event::MouseScrollDelta::LineDelta;
-            use crate::event::ElementState::{Pressed, Released};
-
-            if let Some(data) = get_raw_input_data(lparam as _) {
-                let device_id = wrap_device_id(data.header.hDevice as _);
-
-                if data.header.dwType == winuser::RIM_TYPEMOUSE {
-                    let mouse = data.data.mouse();
-
-                    if util::has_flag(mouse.usFlags, winuser::MOUSE_MOVE_RELATIVE) {
-                        let x = mouse.lLastX as f64;
-                        let y = mouse.lLastY as f64;
-
-                        if x != 0.0 {
-                            subclass_input.send_event(Event::DeviceEvent {
-                                device_id,
-                                event: Motion { axis: 0, value: x },
-                            });
-                        }
-
-                        if y != 0.0 {
-                            subclass_input.send_event(Event::DeviceEvent {
-                                device_id,
-                                event: Motion { axis: 1, value: y },
-                            });
-                        }
-
-                        if x != 0.0 || y != 0.0 {
-                            subclass_input.send_event(Event::DeviceEvent {
-                                device_id,
-                                event: MouseMotion { delta: (x, y) },
-                            });
-                        }
-                    }
-
-                    if util::has_flag(mouse.usButtonFlags, winuser::RI_MOUSE_WHEEL) {
-                        let delta = mouse.usButtonData as SHORT / winuser::WHEEL_DELTA;
-                        subclass_input.send_event(Event::DeviceEvent {
-                            device_id,
-                            event: MouseWheel { delta: LineDelta(0.0, delta as f32) },
-                        });
-                    }
-
-                    let button_state = get_raw_mouse_button_state(mouse.usButtonFlags);
-                    // Left, middle, and right, respectively.
-                    for (index, state) in button_state.iter().enumerate() {
-                        if let Some(state) = *state {
-                            // This gives us consistency with X11, since there doesn't
-                            // seem to be anything else reasonable to do for a mouse
-                            // button ID.
-                            let button = (index + 1) as _;
-                            subclass_input.send_event(Event::DeviceEvent {
-                                device_id,
-                                event: Button {
-                                    button,
-                                    state,
-                                },
-                            });
-                        }
-                    }
-                } else if data.header.dwType == winuser::RIM_TYPEKEYBOARD {
-                    let keyboard = data.data.keyboard();
-
-                    let pressed = keyboard.Message == winuser::WM_KEYDOWN
-                        || keyboard.Message == winuser::WM_SYSKEYDOWN;
-                    let released = keyboard.Message == winuser::WM_KEYUP
-                        || keyboard.Message == winuser::WM_SYSKEYUP;
-
-                    if pressed || released {
-                        let state = if pressed {
-                            Pressed
-                        } else {
-                            Released
-                        };
-
-                        let scancode = keyboard.MakeCode as _;
-                        let extended = util::has_flag(keyboard.Flags, winuser::RI_KEY_E0 as _)
-                            | util::has_flag(keyboard.Flags, winuser::RI_KEY_E1 as _);
-                        if let Some((vkey, scancode)) = handle_extended_keys(
-                            keyboard.VKey as _,
-                            scancode,
-                            extended,
-                        ) {
-                            let virtual_keycode = vkey_to_winit_vkey(vkey);
-
-                            subclass_input.send_event(Event::DeviceEvent {
-                                device_id,
-                                event: Key(KeyboardInput {
-                                    scancode,
-                                    state,
-                                    virtual_keycode,
-                                    modifiers: event::get_key_mods(),
-                                }),
-                            });
-                        }
-                    }
-                }
-            }
-
-            commctrl::DefSubclassProc(window, msg, wparam, lparam)
         },
 
         winuser::WM_TOUCH => {
@@ -1341,7 +1285,6 @@ unsafe extern "system" fn public_window_callback<T>(
                             },
                             location,
                             id: input.dwID as u64,
-                            device_id: DEVICE_ID,
                         }),
                     });
                 }
@@ -1547,7 +1490,7 @@ unsafe extern "system" fn thread_event_target_callback<T>(
                 );
             };
             let in_modal_loop = {
-                let runner = subclass_input.event_loop_runner.runner.borrow_mut();
+                let runner = subclass_input.shared_data.runner_shared.runner.borrow_mut();
                 if let Some(ref runner) = *runner {
                     runner.in_modal_loop
                 } else {
@@ -1582,7 +1525,7 @@ unsafe extern "system" fn thread_event_target_callback<T>(
                     }
                 }
 
-                let mut runner = subclass_input.event_loop_runner.runner.borrow_mut();
+                let mut runner = subclass_input.shared_data.runner_shared.runner.borrow_mut();
                 if let Some(ref mut runner) = *runner {
                     runner.events_cleared();
                     match runner.control_flow {
@@ -1603,6 +1546,245 @@ unsafe extern "system" fn thread_event_target_callback<T>(
             }
             0
         }
+        winuser::WM_INPUT_DEVICE_CHANGE => {
+            use super::raw_input::RawDeviceInfo;
+
+            let handle = lparam as HANDLE;
+
+            match wparam as _ {
+                winuser::GIDC_ARRIVAL => {
+                    if let Some(handle_info) = raw_input::get_raw_input_device_info(handle) {
+                        let device: DeviceId;
+                        let event: Event<T>;
+
+                        match handle_info {
+                            RawDeviceInfo::Mouse(_) => {
+                                let mouse_id = MouseId(handle);
+                                device = DeviceId::Mouse(mouse_id);
+                                event = Event::MouseEvent(
+                                    mouse_id.into(),
+                                    MouseEvent::Added,
+                                );
+                            },
+                            RawDeviceInfo::Keyboard(_) => {
+                                let keyboard_id = KeyboardId(handle);
+                                device = DeviceId::Keyboard(keyboard_id);
+                                event = Event::KeyboardEvent(
+                                    keyboard_id.into(),
+                                    KeyboardEvent::Added,
+                                );
+                            },
+                            RawDeviceInfo::Hid(_) => {
+                                match Gamepad::new(handle) {
+                                    Some(gamepad) => {
+                                        let gamepad_handle = GamepadHandle {
+                                            handle,
+                                            shared_data: gamepad.shared_data(),
+                                        };
+
+                                        device = DeviceId::Gamepad(gamepad_handle.clone(), gamepad);
+                                        event = Event::GamepadEvent(
+                                            gamepad_handle.into(),
+                                            GamepadEvent::Added,
+                                        );
+                                    },
+                                    None => {
+                                        let hid_id = HidId(handle);
+                                        device = DeviceId::Hid(hid_id.into());
+                                        event = Event::HidEvent(
+                                            hid_id.into(),
+                                            HidEvent::Added,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        subclass_input.shared_data.active_device_ids.borrow_mut().insert(handle, device);
+                        subclass_input.send_event(event);
+                    }
+                },
+                winuser::GIDC_REMOVAL => {
+                    let removed_device = subclass_input.shared_data.active_device_ids.borrow_mut().remove(&handle);
+                    if let Some(device_id) = removed_device {
+                        let event = match device_id {
+                            DeviceId::Mouse(mouse_id) => Event::MouseEvent(
+                                mouse_id.into(),
+                                MouseEvent::Removed,
+                            ),
+                            DeviceId::Keyboard(keyboard_id) => Event::KeyboardEvent(
+                                keyboard_id.into(),
+                                KeyboardEvent::Removed,
+                            ),
+                            DeviceId::Hid(hid_id) => Event::HidEvent(
+                                hid_id.into(),
+                                HidEvent::Removed,
+                            ),
+                            DeviceId::Gamepad(gamepad_handle, _) => {
+                                Event::GamepadEvent(
+                                    gamepad_handle.into(),
+                                    GamepadEvent::Removed
+                                )
+                            },
+                        };
+                        subclass_input.send_event(event);
+                    }
+                },
+                _ => unreachable!()
+            }
+
+            0
+        },
+
+        winuser::WM_INPUT => {
+            use crate::event::ElementState::{Pressed, Released};
+
+            match get_raw_input_data(lparam as _) {
+                Some(RawInputData::Mouse{device_handle, raw_mouse}) => {
+                    let mouse_handle = MouseId(device_handle).into();
+
+                    if util::has_flag(raw_mouse.usFlags, winuser::MOUSE_MOVE_ABSOLUTE) {
+                        let x = raw_mouse.lLastX as f64;
+                        let y = raw_mouse.lLastY as f64;
+
+                        if x != 0.0 || y != 0.0 {
+                            subclass_input.send_event(
+                                Event::MouseEvent(
+                                    mouse_handle,
+                                    MouseEvent::MovedAbsolute(PhysicalPosition{ x, y }),
+                                )
+                            );
+                        }
+                    } else if util::has_flag(raw_mouse.usFlags, winuser::MOUSE_MOVE_RELATIVE) {
+                        let x = raw_mouse.lLastX as f64;
+                        let y = raw_mouse.lLastY as f64;
+
+                        if x != 0.0 || y != 0.0 {
+                            subclass_input.send_event(
+                                Event::MouseEvent(
+                                    mouse_handle,
+                                    MouseEvent::MovedRelative(x, y),
+                                )
+                            );
+                        }
+                    }
+
+                    if util::has_flag(raw_mouse.usButtonFlags, winuser::RI_MOUSE_WHEEL) {
+                        // TODO: HOW IS RAW WHEEL DELTA HANDLED ON OTHER PLATFORMS?
+                        let delta = raw_mouse.usButtonData as SHORT / winuser::WHEEL_DELTA;
+                        subclass_input.send_event(
+                            Event::MouseEvent(
+                                mouse_handle,
+                                MouseEvent::Wheel(0.0, delta as f64),
+                            )
+                        );
+                    }
+                    // Check if there's horizontal wheel movement.
+                    if util::has_flag(raw_mouse.usButtonFlags, 0x0800) {
+                        // TODO: HOW IS RAW WHEEL DELTA HANDLED ON OTHER PLATFORMS?
+                        let delta = raw_mouse.usButtonData as SHORT / winuser::WHEEL_DELTA;
+                        subclass_input.send_event(
+                            Event::MouseEvent(
+                                mouse_handle,
+                                MouseEvent::Wheel(delta as f64, 0.0),
+                            )
+                        );
+                    }
+
+                    let button_state = get_raw_mouse_button_state(raw_mouse.usButtonFlags);
+                    for (index, state) in button_state.iter().cloned().enumerate().filter_map(|(i, state)| state.map(|s| (i, s))) {
+                        subclass_input.send_event(
+                            Event::MouseEvent(
+                                mouse_handle,
+                                MouseEvent::Button {
+                                    state,
+                                    button: match index {
+                                        0 => MouseButton::Left,
+                                        1 => MouseButton::Middle,
+                                        2 => MouseButton::Right,
+                                        _ => MouseButton::Other(index as u8 - 2),
+                                    },
+                                },
+                            )
+                        );
+                    }
+                },
+                Some(RawInputData::Keyboard{device_handle, raw_keyboard}) => {
+                    let keyboard_id = KeyboardId(device_handle).into();
+
+                    let pressed = raw_keyboard.Message == winuser::WM_KEYDOWN
+                        || raw_keyboard.Message == winuser::WM_SYSKEYDOWN;
+                    let released = raw_keyboard.Message == winuser::WM_KEYUP
+                        || raw_keyboard.Message == winuser::WM_SYSKEYUP;
+
+                    if pressed || released {
+                        let state = if pressed {
+                            Pressed
+                        } else {
+                            Released
+                        };
+
+                        let scancode = raw_keyboard.MakeCode as _;
+                        let extended = util::has_flag(raw_keyboard.Flags, winuser::RI_KEY_E0 as _)
+                            | util::has_flag(raw_keyboard.Flags, winuser::RI_KEY_E1 as _);
+                        if let Some((vkey, scancode)) = handle_extended_keys(
+                            raw_keyboard.VKey as _,
+                            scancode,
+                            extended,
+                        ) {
+                            let virtual_keycode = vkey_to_winit_vkey(vkey);
+
+                            subclass_input.send_event(
+                                Event::KeyboardEvent(
+                                    keyboard_id,
+                                    KeyboardEvent::Input(KeyboardInput {
+                                        scancode,
+                                        state,
+                                        virtual_keycode,
+                                        modifiers: event::get_key_mods(),
+                                    }),
+                                )
+                            );
+                        }
+                    }
+                },
+                Some(RawInputData::Hid{device_handle, mut raw_hid}) => {
+                    let mut gamepad_handle_opt: Option<crate::event::device::GamepadHandle> = None;
+                    let mut gamepad_events = vec![];
+
+                    {
+                        let mut devices = subclass_input.shared_data.active_device_ids.borrow_mut();
+                        let device_id = devices.get_mut(&device_handle);
+                        if let Some(DeviceId::Gamepad(gamepad_handle, ref mut gamepad)) = device_id {
+                            gamepad.update_state(&mut raw_hid.raw_input);
+                            gamepad_events = gamepad.get_gamepad_events();
+                            gamepad_handle_opt = Some(gamepad_handle.clone().into());
+                        }
+                    }
+
+                    if let Some(gamepad_handle) = gamepad_handle_opt {
+                        for gamepad_event in gamepad_events {
+                            subclass_input.send_event(
+                                Event::GamepadEvent(
+                                    gamepad_handle.clone(),
+                                    gamepad_event,
+                                )
+                            );
+                        }
+                    } else {
+                        subclass_input.send_event(
+                            Event::HidEvent(
+                                HidId(device_handle).into(),
+                                HidEvent::Data(raw_hid.raw_input)
+                            )
+                        );
+                    }
+                },
+                None => ()
+            }
+
+            commctrl::DefSubclassProc(window, msg, wparam, lparam)
+        },
         _ if msg == *USER_EVENT_MSG_ID => {
             if let Ok(event) = subclass_input.user_event_receiver.recv() {
                 subclass_input.send_event(Event::UserEvent(event));
